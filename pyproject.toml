@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-ssh-winrm"
+version = "0.1.0"
+description = "MCP server for Windows administration from Linux via SSH jump host and WinRM/PSRemoting"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["mcp", "windows", "powershell", "winrm", "ssh", "administration"]
+dependencies = [
+    "mcp>=1.0.0",
+    "asyncssh>=2.14.0",
+]
+
+[project.scripts]
+mcp-ssh-winrm = "winrm_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/winrm_mcp"]
