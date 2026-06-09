@@ -97,7 +97,6 @@ class WinRMClient:
     async def run_powershell(self, script: str, computer: str | None = None) -> str:
         token = secrets.token_hex(8)
         remote_ps1 = f"{self.temp_dir}\\winrm_{token}.ps1"
-        remote_out = f"{self.temp_dir}\\winrm_{token}.out"
 
         full_script = self._wrap_invoke_command(script, computer) if computer else script
 
@@ -111,25 +110,21 @@ class WinRMClient:
                     f.write(full_script)
                     local_tmp = f.name
                 try:
-                    # SFTP uses forward slashes
-                    remote_ps1_sftp = remote_ps1.replace("\\", "/")
+                    # Windows OpenSSH SFTP expects /C:/path/... format
+                    drive, rest = remote_ps1[0], remote_ps1[2:].replace("\\", "/")
+                    remote_ps1_sftp = f"/{drive}:{rest}"
                     await sftp.put(local_tmp, remote_ps1_sftp)
                 finally:
                     os.unlink(local_tmp)
 
             ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-            run_cmd = (
-                f'cmd /c "{ps_exe} -NoProfile -NonInteractive -ExecutionPolicy Bypass'
-                f' -File \\"{remote_ps1}\\" > \\"{remote_out}\\" 2>&1"'
+            result = await conn.run(
+                f'{ps_exe} -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{remote_ps1}"',
+                check=False,
             )
-            await conn.run(run_cmd, check=False)
+            output = (result.stdout or "") + (result.stderr or "")
 
-            read_result = await conn.run(f'cmd /c type "{remote_out}"', check=False)
-            output = read_result.stdout or ""
-
-            await conn.run(
-                f'cmd /c del /f /q "{remote_ps1}" "{remote_out}" 2>nul', check=False
-            )
+            await conn.run(f'cmd /c del /f /q "{remote_ps1}" 2>nul', check=False)
 
         return output.strip()
 
