@@ -88,6 +88,48 @@ class WinRMClient:
             kwargs["client_keys"] = [self.key]
         return kwargs
 
+    def _domain_credentials_header(self) -> str:
+        """Prepend $DomainUser/$DomainPassword variables to a single-hop script.
+
+        For operations that write a security descriptor / ACL on an AD or
+        GPO object (Set-Acl -Path AD:\\..., dsacls.exe, Set-GPPermission,
+        raw DirectoryEntry.ObjectSecurity edits) — Invoke-Command's classic
+        "double hop" silently no-ops: the call reports success and an
+        immediate readback even shows the change, but repadmin
+        /showobjmeta proves the attribute version never actually moved.
+        Ordinary attribute writes (e.g. description) are NOT affected —
+        this is specific to security-descriptor writes.
+
+        The reliable pattern is a single-hop script (no computer=, so no
+        nested Invoke-Command) that does its own LDAP bind with explicit
+        credentials via System.DirectoryServices, e.g.:
+
+            $de = New-Object System.DirectoryServices.DirectoryEntry(
+                "LDAP://<dc>/<DN>", $DomainUser, $DomainPassword)
+            $de.ObjectSecurity.AddAccessRule(...)   # or RemoveAccessRule
+            $de.CommitChanges()
+
+        This helper injects those two variables so the caller never has to
+        paste the plaintext password into the script text themselves.
+
+        Also verify with a *fresh* DirectoryEntry/repadmin re-read after
+        CommitChanges — don't trust the same $de object or Get-Acl -Path
+        AD:\\/Get-GPPermission through a *second* Invoke-Command hop, both
+        of which have independently shown unreliable (false-negative)
+        reads in this environment.
+        """
+        if not self.domain_user or not self.domain_password:
+            raise ValueError(
+                "domain.user and WINRM_MCP_PASSWORD env var are required for "
+                "with_domain_credentials"
+            )
+        safe_user = self.domain_user.replace("'", "''")
+        safe_password = self.domain_password.replace("'", "''")
+        return (
+            f"$DomainUser = '{safe_user}'\n"
+            f"$DomainPassword = '{safe_password}'\n"
+        )
+
     def _wrap_invoke_command(self, script: str, computer: str) -> str:
         """Wrap script in Invoke-Command for PSRemoting to a remote computer."""
         if not self.domain_user or not self.domain_password:
@@ -124,11 +166,26 @@ class WinRMClient:
         assert last_exc is not None
         raise last_exc
 
-    async def run_powershell(self, script: str, computer: str | None = None) -> str:
+    async def run_powershell(
+        self,
+        script: str,
+        computer: str | None = None,
+        with_domain_credentials: bool = False,
+    ) -> str:
+        if with_domain_credentials and computer:
+            raise ValueError(
+                "with_domain_credentials is for single-hop scripts only — combining it "
+                "with computer= would just recreate the double-hop pattern it exists to "
+                "avoid. Omit computer= and do the LDAP bind (or similar) inside the "
+                "script itself, targeting whichever server you need by name."
+            )
+
         token = secrets.token_hex(8)
         remote_ps1 = f"{self.temp_dir}\\winrm_{token}.ps1"
 
         full_script = self._wrap_invoke_command(script, computer) if computer else script
+        if with_domain_credentials:
+            full_script = self._domain_credentials_header() + full_script
         if self.extra_ps_module_paths:
             prefix = "$env:PSModulePath += ';" + ";".join(self.extra_ps_module_paths) + "'\n"
             full_script = prefix + full_script
@@ -225,7 +282,22 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Run a PowerShell script on the Windows management server, "
                 "or on a remote Windows computer via PSRemoting (WinRM/Invoke-Command). "
-                "Returns stdout+stderr combined."
+                "Returns stdout+stderr combined.\n\n"
+                "WARNING — double-hop and AD/GPO security-descriptor writes: when "
+                "computer= is set, the script runs via Invoke-Command -Credential, "
+                "a classic PowerShell 'double hop'. Ordinary attribute writes work "
+                "fine this way, but writing a security descriptor / ACL (Set-Acl "
+                "-Path AD:\\..., dsacls.exe, Set-GPPermission, GPO Security "
+                "Filtering, DirectoryEntry.ObjectSecurity edits) silently no-ops "
+                "under double-hop — it reports success, an immediate readback even "
+                "looks changed, but nothing actually commits (confirmed via "
+                "repadmin /showobjmeta). For that class of operation, use "
+                "with_domain_credentials=true instead (omit computer=) and do a "
+                "single-hop LDAP bind with explicit credentials inside the script. "
+                "Also don't trust Get-Acl -Path AD:\\ or Get-GPPermission read "
+                "through a second Invoke-Command hop to verify — both have shown "
+                "unreliable/false-negative reads here too; re-read with a fresh "
+                "single-hop DirectoryEntry instead."
             ),
             inputSchema={
                 "type": "object",
@@ -239,7 +311,23 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "Optional. Target computer hostname or IP. "
                             "Script runs via Invoke-Command (PSRemoting) on this host. "
-                            "Omit to run directly on the management server."
+                            "Omit to run directly on the management server. Do not "
+                            "combine with with_domain_credentials, and do not use this "
+                            "for AD/GPO ACL writes — see the double-hop warning above."
+                        ),
+                    },
+                    "with_domain_credentials": {
+                        "type": "boolean",
+                        "description": (
+                            "Optional, default false. Prepends $DomainUser/"
+                            "$DomainPassword variables to the script (from this "
+                            "server's configured domain account) instead of you "
+                            "having to paste the plaintext password into the script "
+                            "yourself. Use for single-hop scripts (no computer=) that "
+                            "need explicit AD credentials, e.g. writing a security "
+                            "descriptor via System.DirectoryServices.DirectoryEntry — "
+                            "see the double-hop warning above for why this is needed "
+                            "instead of computer=."
                         ),
                     },
                 },
@@ -274,6 +362,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         output = await client.run_powershell(
             script=arguments["script"],
             computer=arguments.get("computer"),
+            with_domain_credentials=arguments.get("with_domain_credentials", False),
         )
         return [TextContent(type="text", text=output or "(no output)")]
 
