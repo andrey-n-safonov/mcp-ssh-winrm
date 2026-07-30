@@ -13,6 +13,7 @@ Tools:
 import asyncio
 import configparser
 import os
+import re
 import secrets
 import tempfile
 from pathlib import Path
@@ -21,6 +22,8 @@ import asyncssh
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+
+_ANSI_ESCAPE = re.compile(r'\x1b(?:\[[0-9;]*[A-Za-z]|\][^\x07]*\x07|[()][AB012])')
 
 # ---------------------------------------------------------------------------
 # Config
@@ -58,6 +61,12 @@ class WinRMClient:
         key_path = ssh.get("key", fallback="")
         self.key = os.path.expanduser(key_path) if key_path else None
         self.temp_dir = ssh.get("temp_dir", fallback=r"C:\Temp\mcp-ssh-winrm")
+        extra = ssh.get("extra_ps_module_paths", "")
+        self.extra_ps_module_paths = [p.strip() for p in extra.split(";") if p.strip()]
+        self.command_timeout = ssh.getfloat("command_timeout", fallback=300.0)
+        self.cleanup_timeout = ssh.getfloat("cleanup_timeout", fallback=15.0)
+        self.connect_retries = ssh.getint("connect_retries", fallback=2)
+        self.connect_retry_delay = ssh.getfloat("connect_retry_delay", fallback=3.0)
 
         domain = cfg["domain"] if cfg.has_section("domain") else {}
         self.domain_user = domain.get("user", "")
@@ -70,6 +79,8 @@ class WinRMClient:
             "port": self.port,
             "known_hosts": None,
             "config": [os.path.expanduser("~/.ssh/config")],
+            "keepalive_interval": 30,
+            "keepalive_count_max": 10,
         }
         if self.user:
             kwargs["username"] = self.user
@@ -94,13 +105,36 @@ class WinRMClient:
             f"}}"
         )
 
+    async def _connect(self) -> asyncssh.SSHClientConnection:
+        """Connect with retry on transient (connection-establishment) failures only.
+
+        Retrying after a script has started executing is deliberately out of
+        scope here — re-running a non-idempotent remote command on a dropped
+        mid-execution connection could apply it twice. Only the initial
+        handshake is retried.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(self.connect_retries + 1):
+            try:
+                return await asyncssh.connect(**self._ssh_kwargs())
+            except (asyncssh.Error, OSError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+                if attempt < self.connect_retries:
+                    await asyncio.sleep(self.connect_retry_delay)
+        assert last_exc is not None
+        raise last_exc
+
     async def run_powershell(self, script: str, computer: str | None = None) -> str:
         token = secrets.token_hex(8)
         remote_ps1 = f"{self.temp_dir}\\winrm_{token}.ps1"
 
         full_script = self._wrap_invoke_command(script, computer) if computer else script
+        if self.extra_ps_module_paths:
+            prefix = "$env:PSModulePath += ';" + ";".join(self.extra_ps_module_paths) + "'\n"
+            full_script = prefix + full_script
 
-        async with asyncssh.connect(**self._ssh_kwargs()) as conn:
+        conn = await self._connect()
+        try:
             await conn.run(f'cmd /c mkdir "{self.temp_dir}" 2>nul', check=False)
 
             async with conn.start_sftp_client() as sftp:
@@ -118,15 +152,46 @@ class WinRMClient:
                     os.unlink(local_tmp)
 
             ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-            result = await conn.run(
-                f'{ps_exe} -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{remote_ps1}"',
-                check=False,
-            )
-            output = (result.stdout or "") + (result.stderr or "")
+            try:
+                result = await asyncio.wait_for(
+                    conn.run(
+                        f'{ps_exe} -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{remote_ps1}"',
+                        check=False,
+                    ),
+                    timeout=self.command_timeout,
+                )
+                output = (result.stdout or "") + (result.stderr or "")
+            except asyncio.TimeoutError:
+                # The remote powershell.exe may still be running detached on the
+                # target after the channel wait is cancelled — we only give up
+                # waiting on our end, we don't (can't reliably) kill it remotely.
+                # Cleanup below still runs (best-effort) — the script itself
+                # contains a plaintext domain password and shouldn't linger.
+                output = (
+                    f"[ERROR] Command timed out after {self.command_timeout:.0f}s "
+                    f"waiting for output from {computer or self.host}. "
+                    f"The remote process may still be running detached; it was "
+                    f"not cancelled remotely, only the wait on our end gave up."
+                )
+            finally:
+                # Best-effort cleanup with its own short timeout — if the
+                # connection is already unresponsive after the main command
+                # timed out, don't let cleanup hang the whole call too.
+                try:
+                    await asyncio.wait_for(
+                        conn.run(f'cmd /c del /f /q "{remote_ps1}" 2>nul', check=False),
+                        timeout=self.cleanup_timeout,
+                    )
+                except (asyncssh.Error, OSError, asyncio.TimeoutError):
+                    pass
+        finally:
+            conn.close()
+            try:
+                await asyncio.wait_for(conn.wait_closed(), timeout=self.cleanup_timeout)
+            except asyncio.TimeoutError:
+                pass
 
-            await conn.run(f'cmd /c del /f /q "{remote_ps1}" 2>nul', check=False)
-
-        return output.strip()
+        return _ANSI_ESCAPE.sub("", output).strip()
 
     async def check_winrm(self, computer: str) -> str:
         script = (
