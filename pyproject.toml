@@ -11,8 +11,8 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 keywords = ["mcp", "windows", "powershell", "winrm", "ssh", "administration"]
 dependencies = [
-    "mcp>=1.0.0",
-    "asyncssh>=2.14.0",
+    "mcp>=1.27,<2",  # 2.x has a different low-level Server API
+    "asyncssh>=2.23,<3",
 ]
 
 [project.scripts]
