@@ -20,3 +20,11 @@ mcp-ssh-winrm = "winrm_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/winrm_mcp"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--ignore=tests/live_smoke.py --ignore=tests/e2e_mcp.py"
