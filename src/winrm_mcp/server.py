@@ -102,7 +102,7 @@ def format_tcp(rows: list[dict], deep: bool) -> str:
 # MCP server
 # ---------------------------------------------------------------------------
 
-server = Server("mcp-ssh-winrm")
+_NAME = "mcp-ssh-winrm"
 _pool: WorkerPool | None = None
 
 
@@ -163,8 +163,7 @@ RUN_DESCRIPTION = (
 )
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
+async def _list_tools() -> list[Tool]:
     return [
         Tool(
             name="run_powershell",
@@ -254,8 +253,7 @@ def _text(text: str, is_error: bool = False) -> CallToolResult:
     return CallToolResult(content=[TextContent(type="text", text=text)], isError=is_error)
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> CallToolResult:
+async def _call_tool(name: str, arguments: dict) -> CallToolResult:
     pool = get_pool()
     try:
         if name == "run_powershell":
@@ -286,6 +284,28 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
         return _text(f"[WINRM MCP ERROR] {exc}", True)
 
     return _text(f"Unknown tool: {name}", True)
+
+
+def _build_server() -> Server:
+    """Register handlers for both mcp 1.x (decorators) and 2.x (constructor callbacks)."""
+    if hasattr(Server, "list_tools"):  # mcp 1.x
+        srv = Server(_NAME)
+        srv.list_tools()(_list_tools)
+        srv.call_tool()(_call_tool)
+        return srv
+
+    from mcp.types import ListToolsResult  # mcp 2.x
+
+    async def on_list_tools(ctx, params):
+        return ListToolsResult(tools=await _list_tools())
+
+    async def on_call_tool(ctx, params):
+        return await _call_tool(params.name, params.arguments or {})
+
+    return Server(_NAME, on_list_tools=on_list_tools, on_call_tool=on_call_tool)
+
+
+server = _build_server()
 
 
 def main() -> None:

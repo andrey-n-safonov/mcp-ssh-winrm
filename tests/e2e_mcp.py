@@ -15,7 +15,8 @@ async def call(session, name, args):
     t = time.monotonic()
     res = await session.call_tool(name, args)
     text = "\n".join(c.text for c in res.content)
-    print(f"--- {name}({', '.join(f'{k}={str(v)[:40]!r}' for k, v in args.items())}) {time.monotonic() - t:.2f}s isError={res.isError}\n{text}")
+    is_error = getattr(res, "isError", getattr(res, "is_error", None))  # renamed in mcp 2.x
+    print(f"--- {name}({', '.join(f'{k}={str(v)[:40]!r}' for k, v in args.items())}) {time.monotonic() - t:.2f}s isError={is_error}\n{text}")
     return res
 
 
